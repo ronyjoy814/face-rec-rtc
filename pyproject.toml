@@ -1,0 +1,41 @@
+[project]
+name = "fastrtc-app"
+version = "0.1.0"
+description = "Face recognition system with modular architecture"
+requires-python = ">=3.11"
+dependencies = [
+    "fastrtc>=0.0.29",
+    "google-genai>=1.27.0",
+    "gradio>=5.38.1",
+    "numpy>=2.2.6",
+    "pillow>=11.3.0",
+    "python-dotenv>=1.1.1",
+    "websockets>=15.0.1",
+    "azure-ai-vision-face>=1.0.0b2",
+    "opencv-python>=4.8.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-mock>=3.11.0",
+    "pytest-cov>=4.1.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--tb=short",
+    "--strict-markers",
+    "--disable-warnings",
+]
+markers = [
+    "unit: Unit tests",
+    "integration: Integration tests",
+    "slow: Slow running tests",
+]
