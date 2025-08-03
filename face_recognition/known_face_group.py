@@ -15,6 +15,7 @@ Key Features:
     - Group statistics and reporting
 """
 
+import logging
 import numpy as np
 from typing import List, Dict, Any, Optional
 from azure.ai.vision.face.models import FaceDetectionModel
@@ -40,10 +41,11 @@ class KnownFaceGroup(BaseGroupManager):
         face_similarity_threshold: float = 0.8,
         save_known_images: bool = True,
         cleanup_known_group: bool = False,
-        logger: Optional[Any] = None
+        logger: Optional[Any] = None,
+        log_level: int = logging.INFO
     ):
         """Initialize known face group manager"""
-        super().__init__(endpoint, api_key, max_faces_per_person, face_similarity_threshold, logger)
+        super().__init__(endpoint, api_key, max_faces_per_person, face_similarity_threshold, logger, log_level)
 
         self.base_group_id = group_id
         self.base_group_name = group_name
@@ -73,22 +75,8 @@ class KnownFaceGroup(BaseGroupManager):
         return self.group_id
     
     def identify_faces(self, face_ids: List[str], confidence_threshold: float = 0.6) -> List[Any]:
-        """Identify faces against known group"""
-        try:
-            self.logger.debug(f"Identifying {len(face_ids)} faces against known group: {self.group_id}")
-            
-            identification_results = self.face_client.identify_from_large_person_group(
-                face_ids=face_ids,
-                large_person_group_id=self.group_id,
-                confidence_threshold=confidence_threshold
-            )
-            
-            self.logger.debug(f"Known identification completed: {len(identification_results)} results")
-            return identification_results
-            
-        except Exception as e:
-            self.logger.error(f"Error identifying faces in known group: {e}")
-            return []
+        """Identify faces against known group using common base method"""
+        return super().identify_faces(face_ids, self.group_id, confidence_threshold)
     
     def add_person(self, person_name: str, user_data: str = None) -> Optional[str]:
         """Add a new person to the known group"""
@@ -159,7 +147,7 @@ class KnownFaceGroup(BaseGroupManager):
             return False
 
     def add_face_with_similarity_check(self, face_image: np.ndarray, person_id: str = None,
-                                     similarity_threshold: float = 0.8, confidence_threshold: float = 0.8,
+                                     confidence_threshold: float = 0.8,
                                      time_gap_seconds: int = 0, max_faces_per_person: int = 5) -> Optional[str]:
         """
         Add face to known group with similarity checking and time gap validation
@@ -167,7 +155,6 @@ class KnownFaceGroup(BaseGroupManager):
         Args:
             face_image: Face image to add
             person_id: Specific person ID to add face to (if None, will identify first)
-            similarity_threshold: Minimum similarity to consider a match
             confidence_threshold: Minimum confidence for face matching
             time_gap_seconds: Minimum time gap between faces (default: 0 seconds)
             max_faces_per_person: Maximum faces per person (default: 5)
@@ -176,7 +163,7 @@ class KnownFaceGroup(BaseGroupManager):
             Person ID if face was added, None otherwise
         """
         try:
-            from datetime import datetime, timedelta
+            from datetime import datetime
 
             current_time = datetime.now()
 
@@ -235,194 +222,54 @@ class KnownFaceGroup(BaseGroupManager):
             return None
 
     def get_person_faces(self, person_id: str) -> List[Dict[str, Any]]:
-        """Get all faces for a specific known person"""
-        try:
-            # Get person info which contains persisted_face_ids
-            person = self.face_admin_client.large_person_group.get_person(
-                large_person_group_id=self.group_id,
-                person_id=person_id
-            )
-
-            face_list = []
-            if person and person.persisted_face_ids:
-                for face_id in person.persisted_face_ids:
-                    try:
-                        # Get individual face details
-                        face = self.face_admin_client.large_person_group.get_face(
-                            large_person_group_id=self.group_id,
-                            person_id=person_id,
-                            persisted_face_id=face_id
-                        )
-                        face_info = {
-                            'face_id': face.persisted_face_id,
-                            'user_data': face.user_data or ''
-                        }
-                        face_list.append(face_info)
-                    except Exception as face_error:
-                        self.logger.debug(f"Could not get face {face_id}: {face_error}")
-
-            return face_list
-
-        except Exception as e:
-            self.logger.error(f"Error getting known person faces: {e}")
-            return []
+        """Get all faces for a specific known person using base class method"""
+        return super().get_person_faces_from_api(person_id, self.group_id)
     
     def get_person_info(self, person_id: str) -> Optional[Dict[str, Any]]:
-        """Get information about a person"""
-        try:
-            person = self.face_admin_client.large_person_group.get_person(self.group_id, person_id)
-            if person:
-                return {
-                    'person_id': person.person_id,
-                    'name': person.name,
-                    'user_data': person.user_data,
-                    'persisted_face_ids': person.persisted_face_ids
-                }
-            return None
-            
-        except Exception as e:
-            self.logger.error(f"Error getting person info for {person_id}: {e}")
-            return None
+        """Get information about a person using base class method"""
+        return super().get_person_info_from_api(person_id, self.group_id)
     
     def list_persons(self) -> List[Dict[str, Any]]:
-        """List all persons in the known group"""
-        try:
-            persons = self.face_admin_client.large_person_group.get_persons(self.group_id)
-            return [
-                {
-                    'person_id': person.person_id,
-                    'name': person.name,
-                    'user_data': person.user_data,
-                    'face_count': len(person.persisted_face_ids) if person.persisted_face_ids else 0
-                }
-                for person in persons
-            ]
-
-        except Exception as e:
-            self.logger.error(f"Error listing persons: {e}")
-            return []
+        """List all persons in the known group using base class method"""
+        return super().list_persons_in_group(self.group_id)
     
     def delete_person(self, person_id: str) -> bool:
-        """Delete a person from the known group"""
+        """Delete a person from the known group and clean up their folder"""
         try:
-            self.face_admin_client.large_person_group.delete_person(self.group_id, person_id)
-            self.logger.info(f"Successfully deleted person {person_id}")
-
-            # Trigger training after person deletion
-            self.logger.info("Starting known group training after person deletion")
-            training_success = self.train_group()
-            if training_success:
-                self.logger.info("✅ Known group training completed after deletion")
-            else:
-                self.logger.warning("❌ Known group training failed after deletion")
-
-            return True
-
+            # Delete from Azure API using base class method
+            success = super().delete_person_with_training(self.group_id, person_id, "known group")
+            
+            if success and hasattr(self, 'group_manager') and self.group_manager:
+                # Clean up the person's folder from file system
+                self.group_manager._cleanup_person_files(person_id, True)
+                self.logger.info(f"Cleaned up folder for deleted known person: {person_id}")
+            
+            return success
         except Exception as e:
-            self.logger.error(f"Error deleting person {person_id}: {e}")
+            self.logger.error(f"Error deleting known person {person_id}: {e}")
             return False
     
     def train_group(self) -> bool:
-        """Train the known group"""
-        try:
-            # Check if training is already running
-            current_status = self.get_training_status()
-
-            if current_status == "running":
-                self.logger.info(f"Training already running for known group: {self.group_id}, waiting for completion...")
-
-                # Wait for current training to complete
-                import time
-                max_wait_time = 300  # 5 minutes max wait
-                wait_interval = 5    # Check every 5 seconds
-                waited_time = 0
-
-                while current_status == "running" and waited_time < max_wait_time:
-                    time.sleep(wait_interval)
-                    waited_time += wait_interval
-                    current_status = self.get_training_status()
-                    self.logger.debug(f"Waiting for training completion... Status: {current_status} ({waited_time}s)")
-
-                if current_status == "running":
-                    self.logger.warning(f"Training still running after {max_wait_time}s, proceeding anyway")
-                else:
-                    self.logger.info(f"Previous training completed with status: {current_status}")
-
-            # Start new training
-            self.logger.info(f"Starting training for known group: {self.group_id}")
-            self.face_admin_client.large_person_group.begin_train(self.group_id)
-            return True
-
-        except Exception as e:
-            self.logger.error(f"Error training known group: {e}")
-            return False
+        """Train the known group using base class method"""
+        return super().train_group(self.group_id)
     
     def get_training_status(self) -> str:
-        """Get training status of the known group"""
-        try:
-            training_status = self.face_admin_client.large_person_group.get_training_status(self.group_id)
-            return training_status.status
-            
-        except Exception as e:
-            self.logger.error(f"Error getting training status: {e}")
-            return "unknown"
+        """Get training status of the known group using base class method"""
+        return super().get_training_status_simple(self.group_id)
     
-    def _save_known_face_image(self, person_id: str, face_image: np.ndarray):
-        """Save known face image to disk"""
-        try:
-            import cv2
-            from datetime import datetime
-            
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"known_{person_id}_{timestamp}.jpg"
-            filepath = self.known_images_dir / filename
-            
-            cv2.imwrite(str(filepath), face_image)
-            self.logger.debug(f"Saved known face image: {filepath}")
-            
-        except Exception as e:
-            self.logger.error(f"Error saving known face image: {e}")
+
 
     def _get_person_name(self, person_id: str) -> Optional[str]:
-        """Get person name by person ID"""
-        try:
-            person = self.face_admin_client.large_person_group.get_person(
-                large_person_group_id=self.group_id,
-                person_id=person_id
-            )
-            return person.name if person else None
-        except Exception as e:
-            self.logger.error(f"Error getting person name for {person_id}: {e}")
-            return None
+        """Get person name by person ID using base class method"""
+        return super().get_person_name_from_api(person_id, self.group_id)
 
     def set_group_manager(self, group_manager):
-        """Set reference to the parent group manager for file operations"""
-        self.group_manager = group_manager
+        """Set reference to the parent group manager for file operations using base class method"""
+        super().set_group_manager_reference(group_manager)
 
     def get_group_stats(self) -> Dict[str, Any]:
-        """Get statistics about the known group"""
-        try:
-            persons = self.list_persons()
-            total_persons = len(persons)
-            total_faces = sum(person['face_count'] for person in persons)
-            
-            return {
-                'group_id': self.group_id,
-                'group_name': self.base_group_name,
-                'total_persons': total_persons,
-                'total_faces': total_faces,
-                'training_status': self.get_training_status()
-            }
-            
-        except Exception as e:
-            self.logger.error(f"Error getting group stats: {e}")
-            return {
-                'group_id': self.group_id,
-                'group_name': self.base_group_name,
-                'total_persons': 0,
-                'total_faces': 0,
-                'training_status': 'unknown'
-            }
+        """Get statistics about the known group using base class method"""
+        return super().get_group_statistics_detailed(self.group_id, self.base_group_name)
 
     def transfer_from_unknown_group(self, unknown_group, person_id: str, person_details: Dict[str, Any]) -> bool:
         """Transfer an unknown person to known group with their details"""

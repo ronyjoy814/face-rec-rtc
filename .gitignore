@@ -8,7 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
-
+venv
 .env
 
 human_face_dataset/
+saved_images/frame_processed/
+saved_images/unknown/

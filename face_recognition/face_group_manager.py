@@ -18,7 +18,6 @@ Key Features:
 import logging
 import time
 import queue
-from datetime import datetime
 import threading
 import numpy as np
 import os
@@ -32,6 +31,7 @@ from azure.ai.vision.face.models import FaceDetectionModel, FaceRecognitionModel
 from azure.ai.vision.face.models import HeadPose, BlurLevel, BlurProperties, ExposureLevel, ExposureProperties
 
 MAX_HEAD_POSE_ANGLE = 30
+REJECTABLE_BLUR_LEVELS = [BlurLevel.medium, BlurLevel.high]
 
 from .known_face_group import KnownFaceGroup
 from .unknown_face_group import UnknownFaceGroup
@@ -85,15 +85,18 @@ class FaceGroupManager:
         cleanup_unknown_images: bool = False,
         cleanup_known_group: bool = False,
         base_save_directory: str = "face_recognition/saved_images",
-        logger: Optional[logging.Logger] = None
+        logger: Optional[logging.Logger] = None,
+        log_level: int = logging.INFO
     ):
         """Initialize face group manager"""
-        
+
         self.endpoint = endpoint
         self.api_key = api_key
         self.group_id = group_id
         self.group_name = group_name
-        self.logger = logger or logging.getLogger(__name__)
+
+        # Set log level based on debug mode
+        self.logger = logger or self._setup_logger(log_level)
         
         # Initialize known face group
         self.known_group = KnownFaceGroup(
@@ -105,7 +108,8 @@ class FaceGroupManager:
             face_similarity_threshold=face_similarity_threshold,
             save_known_images=save_known_images,
             cleanup_known_group=cleanup_known_group,
-            logger=logger
+            logger=logger,
+            log_level=log_level
         )
         
         # Initialize unknown face group
@@ -120,7 +124,8 @@ class FaceGroupManager:
             unknown_confidence_threshold=unknown_confidence_threshold,
             save_unknown_images=save_unknown_images,
             cleanup_unknown_images=cleanup_unknown_images,
-            logger=logger
+            logger=logger,
+            log_level=log_level
         )
 
         # Queue system for background processing
@@ -142,6 +147,21 @@ class FaceGroupManager:
 
         self.logger.info(f"Initialized FaceGroupManager for: {group_name}")
         self.logger.info(f"File system base directory: {self.base_save_directory}")
+
+    def _setup_logger(self, log_level: int = logging.INFO) -> logging.Logger:
+        """Setup logger for the face group manager"""
+        #TODO check log level is accurte
+        logger = logging.getLogger(f"{self.__class__.__name__}")
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter(
+                '%(asctime)s %(name)s %(levelname)s %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+            logger.setLevel(log_level)
+        return logger
 
     def process_frame(self, frame: np.ndarray, auto_add_faces: bool = True,
                                similarity_threshold: float = 0.8, confidence_threshold: float = 0.8,
@@ -256,7 +276,7 @@ class FaceGroupManager:
                 except Exception as e:
                     self.logger.debug(f"Known group identification error: {e}")
 
-                # FAST READ-ONLY identification - unknown group if not identified in known
+                # Try unknown group identification if not found in known group
                 if not is_identified:
                     try:
                         unknown_results = self.unknown_group.identify_faces([str(face_id)], confidence_threshold)
@@ -267,48 +287,59 @@ class FaceGroupManager:
                                 if candidate.confidence >= confidence_threshold:
                                     person_id = candidate.person_id
                                     person_info = self.unknown_group.get_person_info(person_id)
-                                    person_name = person_info['name'] if person_info else f"person_{self.unknown_group.get_next_person_number()}"
-                                    confidence = candidate.confidence
-                                    is_known = False
-                                    face_color = self._get_person_color(person_name)
-                                    is_identified = True
-                                    unknown_faces += 1
+                                    
+                                    # Only proceed if person_info is valid (person exists)
+                                    if person_info and person_info.get('name'):
+                                        person_name = person_info['name']
+                                        confidence = candidate.confidence
+                                        is_known = False
+                                        face_color = self._get_person_color(person_name)
+                                        is_identified = True
+                                        unknown_faces += 1
 
-                                # Queue for background face addition (NO immediate adding)
-                                if auto_add_faces:
-                                    background_queue_data.append({
-                                        'type': 'add_unknown_face',
-                                        'person_id': person_id,
-                                        'person_name': person_name,
-                                        'face_crop': face_crop.copy(),
-                                        'face_attributes': face_attributes,
-                                        'similarity_threshold': similarity_threshold,
-                                        'confidence_threshold': confidence_threshold,
-                                        'time_gap_seconds': time_gap_seconds,
-                                        'max_faces_per_person': max_faces_per_person,
-                                        'quality_check': quality_check
-                                    })
+                                        # Queue for background face addition to existing unknown person
+                                        if auto_add_faces:
+                                            background_queue_data.append({
+                                                'type': 'add_unknown_face',
+                                                'person_id': person_id,
+                                                'person_name': person_name,
+                                                'face_crop': face_crop.copy(),
+                                                'face_attributes': face_attributes,
+                                                'similarity_threshold': similarity_threshold,
+                                                'confidence_threshold': confidence_threshold,
+                                                'time_gap_seconds': time_gap_seconds,
+                                                'max_faces_per_person': max_faces_per_person,
+                                                'quality_check': quality_check
+                                            })
+                                    else:
+                                        # Person was deleted or doesn't exist, treat as new unknown face
+                                        self.logger.debug(f"Person {person_id} not found in unknown group, treating as new unknown face")
                     except Exception as e:
                         self.logger.debug(f"Unknown group identification error: {e}")
 
                 # New unknown face if not identified anywhere
                 if not is_identified:
                     next_person_number = self.unknown_group.get_next_person_number()
-                    person_name = f"person_{next_person_number}"
-                    confidence = 1.0
+                    generated_person_name = f"person_{next_person_number}"  # Store for background processing
+                    confidence = 0.0  # Set to 0.0 to indicate this is a new unknown face, not an identified one
                     is_known = False
-                    face_color = self._get_person_color(person_name)
+                    face_color = self._get_person_color(generated_person_name)
                     unknown_faces += 1
+                    
+                    # For immediate response, don't set person_name so test recognizes it as unknown
+                    person_name = None  # Clear person_name for immediate response
 
-                    # Queue for background person creation (NO immediate creation)
-                    background_queue_data.append({
-                        'type': 'create_unknown_person',
-                        'person_name': person_name,
-                        'face_crop': face_crop.copy(),
-                        'face_attributes': face_attributes,
-                        'user_data': f"New unknown person, created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                        'quality_check': quality_check
-                    })
+                    # Queue for background person creation
+                    if auto_add_faces:
+                        background_queue_data.append({
+                            'type': 'create_unknown_person',
+                            'person_name': generated_person_name,  # Use the generated name for background processing
+                            'face_crop': face_crop.copy(),
+                            'face_attributes': face_attributes,
+                            'user_data': f"New unknown person, created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                            'quality_check': False,  # Disable quality check for re-identification scenarios
+                            'bypass_similarity_check': True  # Force creation of new person without similarity matching
+                        })
 
                 # Create detected face object for immediate response
                 detected_face = DetectedFace(
@@ -339,10 +370,12 @@ class FaceGroupManager:
                 annotated_frame=annotated_frame
             )
 
-            # BACKGROUND PROCESSING - Step 5: Queue heavy operations
-            if background_queue_data:
+            # BACKGROUND PROCESSING - Step 5: Queue heavy operations ONLY if auto_add_faces is True
+            if auto_add_faces and background_queue_data:
                 self._add_to_processing_queue(background_queue_data)
                 self.logger.debug(f"Queued {len(background_queue_data)} items for background processing")
+            elif not auto_add_faces and background_queue_data:
+                self.logger.debug(f"Skipping background processing of {len(background_queue_data)} items (auto_add_faces=False)")
 
             # Optional: Save Annotated frame in background
             if self.save_processed_frames:
@@ -387,7 +420,7 @@ class FaceGroupManager:
             if hasattr(face_attributes, 'blur') and isinstance(face_attributes.blur, BlurProperties):
                 blur = face_attributes.blur
                 try:
-                    if blur and blur.blur_level in [BlurLevel.medium, BlurLevel.high]:
+                    if blur and blur.blur_level in REJECTABLE_BLUR_LEVELS:
                         self.logger.debug(f"Face rejected: too blurry (blur level = {blur.blur_level})")
                         return False
                 except (ValueError, TypeError):
@@ -675,9 +708,6 @@ class FaceGroupManager:
             self.logger.error(f"Error cleaning up transferred persons: {e}")
             return False
 
-    def train_all_groups(self):
-        """Train both known and unknown groups with coordination"""
-        self._coordinate_training()
 
     # Queue Processing System for Background Operations
 
@@ -867,7 +897,6 @@ class FaceGroupManager:
             # Add face with similarity check
             added = self.known_group.add_face_with_similarity_check(
                 face_crop, person_id,
-                face_data.get('similarity_threshold', 0.8),
                 face_data.get('confidence_threshold', 0.8),
                 face_data.get('time_gap_seconds', 0),
                 face_data.get('max_faces_per_person', 5)
@@ -925,6 +954,7 @@ class FaceGroupManager:
             face_crop = face_data.get('face_crop')
             face_attributes = face_data.get('face_attributes')
             user_data = face_data.get('user_data', '')
+            bypass_similarity_check = face_data.get('bypass_similarity_check', False)
 
             # Quality check
             quality_check = face_data.get('quality_check', True)
@@ -932,8 +962,16 @@ class FaceGroupManager:
                 self.logger.debug(f"Background: Skipping new unknown person {person_name} - poor quality")
                 return
 
-            # Create new unknown person
-            new_person_id = self.unknown_group.add_unknown_person(face_crop, user_data)
+            # Create new unknown person - bypass similarity check if requested
+            if bypass_similarity_check:
+                # Force creation of new person without similarity matching
+                new_person_id = self.unknown_group.add_unknown_person(face_crop, user_data)
+                self.logger.debug(f"Created new unknown person {person_name} (bypassed similarity check)")
+            else:
+                # Use similarity check (existing behavior)
+                new_person_id = self.unknown_group.add_face_with_similarity_check(
+                    face_crop, None, 0.8, 0.8, 0, 5
+                )
 
             if new_person_id:
                 self.logger.info(f"Created new unknown person {person_name}")
@@ -968,11 +1006,20 @@ class FaceGroupManager:
 
             self.logger.info(f"Queue: Transferring unknown person {unknown_person_id} to known as {known_person_name}")
 
-            # Create known person
-            known_person_id = self.known_group.add_person(known_person_name, known_user_data)
-            if not known_person_id:
-                self.logger.error(f"Failed to create known person {known_person_name}")
-                return
+            # Check if a person with this name already exists in known group
+            existing_person_id = self._find_existing_known_person_by_name(known_person_name)
+            
+            if existing_person_id:
+                # Person already exists - add faces to existing person instead of creating new one
+                self.logger.info(f"Queue: Found existing known person {known_person_name} ({existing_person_id}), adding faces to existing person")
+                known_person_id = existing_person_id
+            else:
+                # Create new known person
+                known_person_id = self.known_group.add_person(known_person_name, known_user_data)
+                if not known_person_id:
+                    self.logger.error(f"Failed to create known person {known_person_name}")
+                    return
+                self.logger.info(f"Queue: Created new known person {known_person_name} ({known_person_id})")
 
             # Add all face images to known person
             added_count = 0
@@ -1028,6 +1075,57 @@ class FaceGroupManager:
 
         except Exception as e:
             self.logger.error(f"Error cleaning up unknown person in background: {e}")
+
+    def _find_existing_known_person_by_name(self, person_name: str) -> Optional[str]:
+        """Find existing known person by name and return their person_id"""
+        try:
+            # First, check API for active persons
+            known_persons = self.known_group.list_persons()
+            self.logger.debug(f"Searching for existing person '{person_name}' among {len(known_persons)} known persons")
+            
+            for person_info in known_persons:
+                person_info_name = person_info.get('name')
+                person_info_id = person_info.get('person_id')
+                self.logger.debug(f"Checking person: '{person_info_name}' (ID: {person_info_id})")
+                if person_info_name == person_name:
+                    self.logger.info(f"Found existing known person '{person_name}' with ID: {person_info_id}")
+                    return person_info_id
+            
+            # If not found in API, check file system for existing folders
+            # This handles cases where person was deleted from server but folder remains
+            self.logger.debug(f"Person '{person_name}' not found in API, checking file system...")
+            known_dir = self.base_save_directory / "known"
+            if known_dir.exists():
+                self.logger.debug(f"Scanning {known_dir} for existing folders...")
+                folder_count = 0
+                for person_folder in known_dir.iterdir():
+                    if person_folder.is_dir():
+                        folder_count += 1
+                        json_file = person_folder / "person_data.json"
+                        self.logger.debug(f"Checking folder {person_folder.name}, JSON exists: {json_file.exists()}")
+                        if json_file.exists():
+                            try:
+                                import json
+                                with open(json_file, 'r', encoding='utf-8') as f:
+                                    person_data = json.load(f)
+                                folder_person_name = person_data.get('name')
+                                folder_person_id = person_data.get('person_id', person_folder.name)
+                                self.logger.debug(f"Folder {person_folder.name}: name='{folder_person_name}', id={folder_person_id}")
+                                if folder_person_name == person_name:
+                                    self.logger.info(f"Found existing person '{person_name}' in file system with ID: {folder_person_id}")
+                                    return folder_person_id
+                            except Exception as e:
+                                self.logger.debug(f"Error reading person data from {json_file}: {e}")
+                        else:
+                            self.logger.debug(f"No JSON file in folder {person_folder.name}")
+                self.logger.debug(f"Scanned {folder_count} folders in file system")
+            
+            self.logger.info(f"No existing known person found with name '{person_name}' in API or file system")
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"Error finding existing known person by name {person_name}: {e}")
+            return None
 
     def _cleanup_person_files(self, person_id: str, is_known: bool):
         """Clean up person folder and files from saved_images directory"""
@@ -1695,12 +1793,6 @@ class FaceGroupManager:
         """Get statistics for unknown group only"""
         return self.unknown_group.get_group_stats()
     
-    def list_all_persons(self) -> Dict[str, List[Dict[str, Any]]]:
-        """List all persons from both groups"""
-        return {
-            'known': self.known_group.list_persons(),
-            'unknown': self.unknown_group.list_persons()
-        }
     
     def update_unknown_person(self, person_id: str, new_name: str, designation: str = None) -> bool:
         """Update an unknown person with real name and designation"""
@@ -1828,12 +1920,20 @@ class FaceGroupManager:
         # Train unknown group
         self.unknown_group.train_group()
 
-    def load_faces_from_saved_images(self, group_type: str = "both") -> Dict[str, Any]:
+    def load_faces_from_saved_images(self, group_type: str = "both",
+                                   clear_known_group: bool = False,
+                                   clear_unknown_group: bool = True,
+                                   clear_unknown_images: bool = True,
+                                   clear_known_images: bool = False) -> Dict[str, Any]:
         """
         Load face data from saved_images folder structure and add to groups for training
 
         Args:
             group_type: "known", "unknown", or "both" (default: "both")
+            clear_known_group: Whether to clear known group before loading (default: False - keep existing data)
+            clear_unknown_group: Whether to clear unknown group before loading (default: True - clear all data)
+            clear_known_images: Whether to clear known images before loading (default: False - keep existing images)
+            clear_unknown_images: Whether to clear unknown images before loading (default: True - clear all images)
 
         Returns:
             Dict with loading results and statistics
@@ -1845,6 +1945,24 @@ class FaceGroupManager:
                 'total_persons': 0,
                 'total_faces': 0
             }
+
+            # Clear groups if requested before loading
+            if clear_known_group:
+                self.logger.info("Clearing known group before loading faces from saved images")
+                self.known_group.cleanup_group()
+
+            if clear_unknown_group:
+                self.logger.info("Clearing unknown group before loading faces from saved images")
+                self.unknown_group.cleanup_group()
+
+            if clear_unknown_images:
+                self.logger.info("Clearing unknown images before loading faces from saved images")
+                self.unknown_group.cleanup_unknown_images()
+
+            if clear_known_images:
+                self.logger.info("Clearing known images before loading faces from saved images")
+                #TODO: Implement cleanup_known_images method
+                self.known_group.cleanup_known_images()
 
             # Load known persons if requested
             if group_type in ["known", "both"]:
@@ -1999,7 +2117,6 @@ class FaceGroupManager:
 
                                                     # Update person_id in JSON
                                                     person_data['person_id'] = person_id
-                                                    person_data['azure_person_id'] = person_id
 
                                                     with open(json_file, 'w') as f:
                                                         json.dump(person_data, f, indent=2)

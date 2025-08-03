@@ -17,10 +17,11 @@ Key Features:
 
 import os
 import cv2
+import logging
 import numpy as np
 from typing import List, Dict, Any, Optional
 from datetime import datetime
-from azure.ai.vision.face.models import FaceDetectionModel
+from azure.ai.vision.face.models import FaceDetectionModel, FaceRecognitionModel
 from .base_group_manager import BaseGroupManager
 
 
@@ -45,10 +46,11 @@ class UnknownFaceGroup(BaseGroupManager):
         unknown_confidence_threshold: float = 0.8,
         save_unknown_images: bool = True,
         cleanup_unknown_images: bool = False,
-        logger: Optional[Any] = None
+        logger: Optional[Any] = None,
+        log_level: int = logging.INFO
     ):
         """Initialize unknown face group manager"""
-        super().__init__(endpoint, api_key, max_faces_per_person, face_similarity_threshold, logger)
+        super().__init__(endpoint, api_key, max_faces_per_person, face_similarity_threshold, logger, log_level)
 
         self.base_group_id = group_id
         self.base_group_name = group_name
@@ -121,27 +123,18 @@ class UnknownFaceGroup(BaseGroupManager):
         except Exception as e:
             self.logger.error(f"Error clearing persons from unknown group: {e}")
 
+    def clear_all_persons(self):
+        """Public method to clear all existing persons from the unknown group"""
+        self.logger.info("Manual clear all persons requested for unknown group")
+        self._clear_all_persons()
+
     def get_group_id(self) -> str:
         """Get the unknown group ID"""
         return self.group_id
     
     def identify_faces(self, face_ids: List[str], confidence_threshold: float = 0.6) -> List[Any]:
-        """Identify faces against unknown group"""
-        try:
-            self.logger.debug(f"Identifying {len(face_ids)} faces against unknown group: {self.group_id}")
-            
-            identification_results = self.face_client.identify_from_large_person_group(
-                face_ids=face_ids,
-                large_person_group_id=self.group_id,
-                confidence_threshold=confidence_threshold
-            )
-            
-            self.logger.debug(f"Unknown identification completed: {len(identification_results)} results")
-            return identification_results
-            
-        except Exception as e:
-            self.logger.error(f"Error identifying faces in unknown group: {e}")
-            return []
+        """Identify faces against unknown group using common base method"""
+        return super().identify_faces(face_ids, self.group_id, confidence_threshold)
     
     def add_unknown_person(self, face_image: np.ndarray, user_data: str = None) -> Optional[str]:
         """Add a new unknown person to the group with auto-generated person ID"""
@@ -149,8 +142,9 @@ class UnknownFaceGroup(BaseGroupManager):
             from datetime import datetime
 
             # Generate person name as person_1, person_2, etc.
-            person_name = f"person_{self.unknown_person_counter}"
-            self.unknown_person_counter += 1
+            # Note: get_next_person_number() now handles the increment
+            person_number = self.get_next_person_number()
+            person_name = f"person_{person_number}"
 
             # Create user data with creation timestamp
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -251,89 +245,83 @@ class UnknownFaceGroup(BaseGroupManager):
             Person ID if face was added, None otherwise
         """
         try:
-            from datetime import datetime, timedelta
-            import time
+            from datetime import datetime
 
             current_time = datetime.now()
 
-            # First try to identify against existing unknown persons
-            identified_faces = self.identify_faces([face_image])
+            # First detect face to get face_id for identification
+            face_bytes = self._image_to_bytes(face_image)
+            if not face_bytes:
+                self.logger.error("Failed to convert face image to bytes for similarity check")
+                return self.add_unknown_person(face_image)
+
+            # Detect face to get face_id
+            detected_faces = self.face_client.detect(
+                face_bytes,
+                detection_model=FaceDetectionModel.DETECTION03,
+                recognition_model=FaceRecognitionModel.RECOGNITION04,
+                return_face_id=True
+            )
+
+            if not detected_faces:
+                self.logger.debug("No faces detected in image for similarity check, creating new unknown person")
+                return self.add_unknown_person(face_image)
+
+            face_id = str(detected_faces[0].face_id)
+
+            # Try to identify against existing unknown persons with a more restrictive threshold
+            # Use a higher threshold for unknown person matching to avoid merging different people
+            unknown_similarity_threshold = max(confidence_threshold, 0.995)  # At least 0.995 for unknown matching
+            identified_faces = self.identify_faces([face_id], unknown_similarity_threshold)
 
             for face_result in identified_faces:
-                if (face_result.get('confidence', 0) >= confidence_threshold and
-                    face_result.get('person_id')):
+                if (hasattr(face_result, 'candidates') and face_result.candidates and
+                    len(face_result.candidates) > 0):
+                    
+                    candidate = face_result.candidates[0]
+                    if candidate.confidence >= unknown_similarity_threshold:
+                        matched_person_id = candidate.person_id
 
-                    person_id = face_result['person_id']
+                        # Check if person has reached max faces limit
+                        person_faces = self.get_person_faces(matched_person_id)
+                        if len(person_faces) >= max_faces_per_person:
+                            self.logger.info(f"Person {matched_person_id} has reached max faces limit ({max_faces_per_person})")
+                            continue
 
-                    # Check if person has reached max faces limit
-                    person_faces = self.get_person_faces(person_id)
-                    if len(person_faces) >= max_faces_per_person:
-                        self.logger.info(f"Person {person_id} has reached max faces limit ({max_faces_per_person})")
-                        continue
+                        # Check time gap with existing faces
+                        valid_time_gap = True
+                        for face_info in person_faces:
+                            face_user_data = face_info.get('user_data', '')
+                            if 'Captured:' in face_user_data:
+                                try:
+                                    face_time_str = face_user_data.split('Captured: ')[1]
+                                    face_time = datetime.strptime(face_time_str, "%Y-%m-%d %H:%M:%S")
+                                    time_diff = abs((current_time - face_time).total_seconds())
 
-                    # Check time gap with existing faces
-                    valid_time_gap = True
-                    for face_info in person_faces:
-                        face_user_data = face_info.get('user_data', '')
-                        if 'Captured:' in face_user_data:
-                            try:
-                                face_time_str = face_user_data.split('Captured: ')[1]
-                                face_time = datetime.strptime(face_time_str, "%Y-%m-%d %H:%M:%S")
-                                time_diff = abs((current_time - face_time).total_seconds())
+                                    if time_diff < time_gap_seconds:
+                                        self.logger.info(f"Time gap too small ({time_diff}s < {time_gap_seconds}s) for person {matched_person_id}")
+                                        valid_time_gap = False
+                                        break
+                                except Exception as e:
+                                    self.logger.warning(f"Could not parse face timestamp: {e}")
 
-                                if time_diff < time_gap_seconds:
-                                    self.logger.info(f"Time gap too small ({time_diff}s < {time_gap_seconds}s) for person {person_id}")
-                                    valid_time_gap = False
-                                    break
-                            except Exception as e:
-                                self.logger.warning(f"Could not parse face timestamp: {e}")
-
-                    if valid_time_gap:
-                        # Add face to existing person
-                        face_user_data = f"Captured: {current_time.strftime('%Y-%m-%d %H:%M:%S')}"
-                        if self.add_face_to_person(person_id, face_image, face_user_data):
-                            self.logger.info(f"Added face to existing unknown person {person_id} (similarity: {face_result.get('confidence', 0):.3f})")
-                            return person_id
+                        if valid_time_gap:
+                            # Add face to existing person
+                            face_user_data = f"Captured: {current_time.strftime('%Y-%m-%d %H:%M:%S')}"
+                            if self.add_face_to_person(matched_person_id, face_image, face_user_data):
+                                self.logger.info(f"Added face to existing unknown person {matched_person_id} (similarity: {candidate.confidence:.3f})")
+                                return matched_person_id
 
             # No similar person found, create new unknown person
             return self.add_unknown_person(face_image)
 
         except Exception as e:
             self.logger.error(f"Error in similarity-based face addition: {e}")
-            return None
+            return self.add_unknown_person(face_image)
 
     def get_person_faces(self, person_id: str) -> List[Dict[str, Any]]:
-        """Get all faces for a specific person"""
-        try:
-            # Get person info which contains persisted_face_ids
-            person = self.face_admin_client.large_person_group.get_person(
-                large_person_group_id=self.group_id,
-                person_id=person_id
-            )
-
-            face_list = []
-            if person and person.persisted_face_ids:
-                for face_id in person.persisted_face_ids:
-                    try:
-                        # Get individual face details
-                        face = self.face_admin_client.large_person_group.get_face(
-                            large_person_group_id=self.group_id,
-                            person_id=person_id,
-                            persisted_face_id=face_id
-                        )
-                        face_info = {
-                            'face_id': face.persisted_face_id,
-                            'user_data': face.user_data or ''
-                        }
-                        face_list.append(face_info)
-                    except Exception as face_error:
-                        self.logger.debug(f"Could not get face {face_id}: {face_error}")
-
-            return face_list
-
-        except Exception as e:
-            self.logger.error(f"Error getting person faces: {e}")
-            return []
+        """Get all faces for a specific person using base class method"""
+        return super().get_person_faces_from_api(person_id, self.group_id)
     
     def update_unknown_person(self, person_id: str, new_name: str, designation: str = None) -> bool:
         """Update an unknown person with real name and designation"""
@@ -357,59 +345,16 @@ class UnknownFaceGroup(BaseGroupManager):
             return False
     
     def get_person_info(self, person_id: str) -> Optional[Dict[str, Any]]:
-        """Get information about an unknown person"""
-        try:
-            person = self.face_admin_client.large_person_group.get_person(self.group_id, person_id)
-            if person:
-                return {
-                    'person_id': person.person_id,
-                    'name': person.name,
-                    'user_data': person.user_data,
-                    'persisted_face_ids': person.persisted_face_ids
-                }
-            return None
-            
-        except Exception as e:
-            self.logger.error(f"Error getting unknown person info for {person_id}: {e}")
-            return None
+        """Get information about an unknown person using base class method"""
+        return super().get_person_info_from_api(person_id, self.group_id)
     
     def list_persons(self) -> List[Dict[str, Any]]:
-        """List all persons in the unknown group"""
-        try:
-            persons = self.face_admin_client.large_person_group.get_persons(self.group_id)
-            return [
-                {
-                    'person_id': person.person_id,
-                    'name': person.name,
-                    'user_data': person.user_data,
-                    'face_count': len(person.persisted_face_ids) if person.persisted_face_ids else 0
-                }
-                for person in persons
-            ]
-
-        except Exception as e:
-            self.logger.error(f"Error listing unknown persons: {e}")
-            return []
+        """List all persons in the unknown group using base class method"""
+        return super().list_persons_in_group(self.group_id)
     
     def delete_person(self, person_id: str) -> bool:
-        """Delete an unknown person from the group"""
-        try:
-            self.face_admin_client.large_person_group.delete_person(self.group_id, person_id)
-            self.logger.info(f"Successfully deleted unknown person {person_id}")
-
-            # Trigger training after person deletion
-            self.logger.info("Starting unknown group training after person deletion")
-            training_success = self.train_group()
-            if training_success:
-                self.logger.info("✅ Unknown group training completed after deletion")
-            else:
-                self.logger.warning("❌ Unknown group training failed after deletion")
-
-            return True
-
-        except Exception as e:
-            self.logger.error(f"Error deleting unknown person {person_id}: {e}")
-            return False
+        """Delete an unknown person from the group using base class method"""
+        return super().delete_person_with_training(self.group_id, person_id, "unknown group")
 
     def get_person_id_by_name(self, person_name: str) -> str | None:
         """Get person ID by person name"""
@@ -458,65 +403,14 @@ class UnknownFaceGroup(BaseGroupManager):
             return []
     
     def train_group(self) -> bool:
-        """Train the unknown group"""
-        try:
-            # Check if training is already running
-            current_status = self.get_training_status()
-
-            if current_status == "running":
-                self.logger.info(f"Training already running for unknown group: {self.group_id}, waiting for completion...")
-
-                # Wait for current training to complete
-                import time
-                max_wait_time = 300  # 5 minutes max wait
-                wait_interval = 5    # Check every 5 seconds
-                waited_time = 0
-
-                while current_status == "running" and waited_time < max_wait_time:
-                    time.sleep(wait_interval)
-                    waited_time += wait_interval
-                    current_status = self.get_training_status()
-                    self.logger.debug(f"Waiting for training completion... Status: {current_status} ({waited_time}s)")
-
-                if current_status == "running":
-                    self.logger.warning(f"Training still running after {max_wait_time}s, proceeding anyway")
-                else:
-                    self.logger.info(f"Previous training completed with status: {current_status}")
-
-            # Start new training
-            self.logger.info(f"Starting training for unknown group: {self.group_id}")
-            self.face_admin_client.large_person_group.begin_train(self.group_id)
-            return True
-
-        except Exception as e:
-            self.logger.error(f"Error training unknown group: {e}")
-            return False
+        """Train the unknown group using base class method"""
+        return super().train_group(self.group_id)
     
     def get_training_status(self) -> str:
-        """Get training status of the unknown group"""
-        try:
-            training_status = self.face_admin_client.large_person_group.get_training_status(self.group_id)
-            return training_status.status
-            
-        except Exception as e:
-            self.logger.error(f"Error getting training status: {e}")
-            return "unknown"
+        """Get training status of the unknown group using base class method"""
+        return super().get_training_status_simple(self.group_id)
     
-    def _save_unknown_face_image(self, person_id: str, face_image: np.ndarray):
-        """Save unknown face image to disk"""
-        try:
-            import cv2
-            from datetime import datetime
-            
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"unknown_{person_id}_{timestamp}.jpg"
-            filepath = self.unknown_images_dir / filename
-            
-            cv2.imwrite(str(filepath), face_image)
-            self.logger.debug(f"Saved unknown face image: {filepath}")
-            
-        except Exception as e:
-            self.logger.error(f"Error saving unknown face image: {e}")
+
 
     def _cleanup_unknown_images(self):
         """Clean up all saved unknown images"""
@@ -587,29 +481,8 @@ class UnknownFaceGroup(BaseGroupManager):
         return len(self.pending_known_persons) > 0
 
     def get_group_stats(self) -> Dict[str, Any]:
-        """Get statistics about the unknown group"""
-        try:
-            persons = self.list_persons()
-            total_persons = len(persons)
-            total_faces = sum(person['face_count'] for person in persons)
-            
-            return {
-                'group_id': self.group_id,
-                'group_name': self.base_group_name,
-                'total_persons': total_persons,
-                'total_faces': total_faces,
-                'training_status': self.get_training_status()
-            }
-            
-        except Exception as e:
-            self.logger.error(f"Error getting group stats: {e}")
-            return {
-                'group_id': self.group_id,
-                'group_name': self.base_group_name,
-                'total_persons': 0,
-                'total_faces': 0,
-                'training_status': 'unknown'
-            }
+        """Get statistics about the unknown group using base class method"""
+        return super().get_group_statistics_detailed(self.group_id, self.base_group_name)
 
     # Training Coordination Methods for Complete Workflow
 
@@ -754,21 +627,15 @@ class UnknownFaceGroup(BaseGroupManager):
 
     def get_next_person_number(self) -> int:
         """Get the next available person number for unknown persons"""
-        # Use the internal counter instead of API call to avoid method issues
-        return self.unknown_person_counter
+        # Use the internal counter and increment it to ensure unique numbers
+        current_number = self.unknown_person_counter
+        self.unknown_person_counter += 1
+        return current_number
 
     def _get_person_name(self, person_id: str) -> Optional[str]:
-        """Get person name by person ID"""
-        try:
-            person = self.face_admin_client.large_person_group.get_person(
-                large_person_group_id=self.group_id,
-                person_id=person_id
-            )
-            return person.name if person else None
-        except Exception as e:
-            self.logger.error(f"Error getting person name for {person_id}: {e}")
-            return None
+        """Get person name by person ID using base class method"""
+        return super().get_person_name_from_api(person_id, self.group_id)
 
     def set_group_manager(self, group_manager):
-        """Set reference to the parent group manager for file operations"""
-        self.group_manager = group_manager
+        """Set reference to the parent group manager for file operations using base class method"""
+        super().set_group_manager_reference(group_manager)
